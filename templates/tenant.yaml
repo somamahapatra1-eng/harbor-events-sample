@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One Harbor tenant. Role, queue, queue resource policy, and an SNS subscription
+  filtered by the customer attribute. The same template is used for every tenant.
+
+Parameters:
+  ProjectName:
+    Type: String
+  TenantId:
+    Type: String
+    AllowedPattern: "[a-z0-9-]{1,20}"
+  QueueName:
+    Type: String
+  LambdaRoleArn:
+    Type: String
+  BucketArn:
+    Type: String
+  VpcEndpointIdSqs:
+    Type: String
+  RequireVpcEndpoint:
+    Type: String
+    AllowedValues: ["true", "false"]
+  TenantRoleId:
+    Type: String
+    Description: IAM role unique ID, for example AROA.... A placeholder matches no caller.
+  PeerRegion:
+    Type: String
+    Description: Region of this tenant's other queue. The router reads the real URL from AppConfig.
+
+Conditions:
+  PrivatePathOnly: !Equals [!Ref RequireVpcEndpoint, "true"]
+
+Resources:
+  TenantRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-tenant-${TenantId}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rolesanywhere.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+              - sts:SetSourceIdentity
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: tenant
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SendToOwnQueue
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Queue.Arn
+              - Sid: ReadOwnPrefix
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${BucketArn}/${TenantId}/*"
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref QueueName
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref Queue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - !If
+            - PrivatePathOnly
+            - Sid: AllowRouterThroughEndpoint
+              Effect: Allow
+              Principal:
+                AWS: !Ref LambdaRoleArn
+              Action: sqs:SendMessage
+              Resource: !GetAtt Queue.Arn
+              Condition:
+                StringEquals:
+                  aws:SourceVpce: !Ref VpcEndpointIdSqs
+            - Sid: AllowRouterInSandbox
+              Effect: Allow
+              Principal:
+                AWS: !Ref LambdaRoleArn
+              Action: sqs:SendMessage
+              Resource: !GetAtt Queue.Arn
+          - Sid: AllowTenantRoleThroughEndpoint
+            Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt Queue.Arn
+            Condition:
+              StringLike:
+                aws:userid: !Sub "${TenantRoleId}:*"
+              StringEquals:
+                aws:SourceVpce: !Ref VpcEndpointIdSqs
+          - Sid: AllowTopic
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt Queue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref Topic
+
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${TenantId}-events"
+
+  Subscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: QueuePolicy
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref Topic
+      Endpoint: !GetAtt Queue.Arn
+      FilterPolicyScope: MessageAttributes
+      FilterPolicy:
+        customer:
+          - !Ref TenantId
+      RawMessageDelivery: true
+
+Outputs:
+  QueueUrl:
+    Value: !Ref Queue
+  QueueArn:
+    Value: !GetAtt Queue.Arn
+  RoleArn:
+    Value: !GetAtt TenantRole.Arn
+  RoleId:
+    Value: !GetAtt TenantRole.RoleId
+  PeerRegion:
+    Value: !Ref PeerRegion

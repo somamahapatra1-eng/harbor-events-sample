@@ -1,0 +1,69 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  IAM Roles Anywhere for a caller outside AWS. Bring your own trust-anchor
+  certificate. This stack does not contain a private key.
+
+Parameters:
+  ProjectName:
+    Type: String
+  TrustAnchorPem:
+    Type: String
+    NoEcho: true
+    Description: PEM of a certificate authority you control.
+  TenantQueueArn:
+    Type: String
+
+Resources:
+  TrustAnchor:
+    Type: AWS::RolesAnywhere::TrustAnchor
+    Properties:
+      Name: !Sub "${ProjectName}-external"
+      Enabled: true
+      Source:
+        SourceType: CERTIFICATE_BUNDLE
+        SourceData:
+          X509CertificateData: !Ref TrustAnchorPem
+
+  ExternalRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-external"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rolesanywhere.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+              - sts:SetSourceIdentity
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt TrustAnchor.TrustAnchorArn
+      Policies:
+        - PolicyName: send-one-queue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Ref TenantQueueArn
+
+  Profile:
+    Type: AWS::RolesAnywhere::Profile
+    Properties:
+      Name: !Sub "${ProjectName}-external"
+      Enabled: true
+      DurationSeconds: 900
+      RoleArns:
+        - !GetAtt ExternalRole.Arn
+
+Outputs:
+  TrustAnchorArn:
+    Value: !GetAtt TrustAnchor.TrustAnchorArn
+  ProfileArn:
+    Value: !GetAtt Profile.ProfileArn
+  ExternalRoleArn:
+    Description: After AssumeRole, the caller ARN contains this role name.
+    Value: !GetAtt ExternalRole.Arn

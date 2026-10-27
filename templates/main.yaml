@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Harbor Events root stack. Nested shared API plus one stack per fictional tenant.
+  Mappings, parameters, conditions, Fn::Sub, Fn::GetAtt, and Fn::FindInMap.
+
+Parameters:
+  TemplateBaseUrl:
+    Type: String
+    Description: HTTPS prefix that hosts shared.yaml, tenant.yaml, and roles-anywhere.yaml. No trailing slash.
+  ProjectName:
+    Type: String
+    Default: harbor
+    AllowedPattern: "[a-z0-9-]{1,20}"
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+  AllowedSourceCidr:
+    Type: String
+    Default: 203.0.113.0/24
+    Description: Documentation range. Replace it before any real deploy.
+  VpcEndpointIdSqs:
+    Type: String
+    Default: vpce-0123456789abcdef0
+  VpcEndpointIdS3:
+    Type: String
+    Default: vpce-0fedcba9876543210
+  RequireVpcEndpoint:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  ArtifactBucket:
+    Type: String
+    Description: Bucket that contains router.zip.
+  ArtifactKey:
+    Type: String
+    Default: router.zip
+  CreateExternalAccess:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  TrustAnchorPem:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Your own CA certificate PEM. Required only when CreateExternalAccess is true.
+
+Conditions:
+  RetainData: !Equals [!Ref Environment, prod]
+  EnableExternalAccess: !Equals [!Ref CreateExternalAccess, "true"]
+
+Mappings:
+  RegionConfig:
+    us-east-1:
+      QueueSuffix: use1
+      PeerRegion: eu-west-1
+    eu-west-1:
+      QueueSuffix: euw1
+      PeerRegion: us-east-1
+
+Resources:
+  Shared:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/shared.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        AllowedSourceCidr: !Ref AllowedSourceCidr
+        VpcEndpointIdS3: !Ref VpcEndpointIdS3
+        ArtifactBucket: !Ref ArtifactBucket
+        ArtifactKey: !Ref ArtifactKey
+        RetainData: !If [RetainData, "true", "false"]
+
+  Acme:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/tenant.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        TenantId: acme
+        QueueName: !Sub
+          - "${Project}-${Tenant}-${Suffix}"
+          - Project: !Ref ProjectName
+            Tenant: acme
+            Suffix: !FindInMap [RegionConfig, !Ref "AWS::Region", QueueSuffix]
+        LambdaRoleArn: !GetAtt Shared.Outputs.RouterRoleArn
+        BucketArn: !GetAtt Shared.Outputs.BucketArn
+        VpcEndpointIdSqs: !Ref VpcEndpointIdSqs
+        RequireVpcEndpoint: !Ref RequireVpcEndpoint
+        TenantRoleId: AROAEXAMPLEACME1234567
+        PeerRegion: !FindInMap [RegionConfig, !Ref "AWS::Region", PeerRegion]
+
+  Globex:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/tenant.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        TenantId: globex
+        QueueName: !Sub
+          - "${Project}-${Tenant}-${Suffix}"
+          - Project: !Ref ProjectName
+            Tenant: globex
+            Suffix: !FindInMap [RegionConfig, !Ref "AWS::Region", QueueSuffix]
+        LambdaRoleArn: !GetAtt Shared.Outputs.RouterRoleArn
+        BucketArn: !GetAtt Shared.Outputs.BucketArn
+        VpcEndpointIdSqs: !Ref VpcEndpointIdSqs
+        RequireVpcEndpoint: !Ref RequireVpcEndpoint
+        TenantRoleId: AROAEXAMPLEGLOBEX12345
+        PeerRegion: !FindInMap [RegionConfig, !Ref "AWS::Region", PeerRegion]
+
+  ExternalAccess:
+    Type: AWS::CloudFormation::Stack
+    Condition: EnableExternalAccess
+    Properties:
+      TemplateURL: !Sub "${TemplateBaseUrl}/roles-anywhere.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        TrustAnchorPem: !Ref TrustAnchorPem
+        TenantQueueArn: !GetAtt Acme.Outputs.QueueArn
+
+Outputs:
+  ApiEndpoint:
+    Value: !GetAtt Shared.Outputs.ApiEndpoint
+  AcmeQueueUrl:
+    Value: !GetAtt Acme.Outputs.QueueUrl
+  GlobexQueueUrl:
+    Value: !GetAtt Globex.Outputs.QueueUrl
+  AcmeRoleId:
+    Description: Copy this into TenantRoleId on the next update. The placeholder in the first deploy matches nothing.
+    Value: !GetAtt Acme.Outputs.RoleId
+  GlobexRoleId:
+    Value: !GetAtt Globex.Outputs.RoleId
+  PeerRegion:
+    Value: !FindInMap [RegionConfig, !Ref "AWS::Region", PeerRegion]

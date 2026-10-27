@@ -1,0 +1,10 @@
+{
+  "acme": {
+    "region": "us-east-1",
+    "queue_url": "https://sqs.us-east-1.amazonaws.com/123456789012/harbor-acme-use1"
+  },
+  "globex": {
+    "region": "eu-west-1",
+    "queue_url": "https://sqs.eu-west-1.amazonaws.com/123456789012/harbor-globex-euw1"
+  }
+}

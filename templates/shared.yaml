@@ -1,0 +1,296 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Shared Harbor API. Cognito user pool, REST API with SigV4 and JWT methods,
+  an IP resource policy, the router Lambda, AppConfig, and an S3 bucket.
+
+Parameters:
+  ProjectName:
+    Type: String
+  Environment:
+    Type: String
+  AllowedSourceCidr:
+    Type: String
+  VpcEndpointIdS3:
+    Type: String
+  ArtifactBucket:
+    Type: String
+  ArtifactKey:
+    Type: String
+  RetainData:
+    Type: String
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  KeepBucket: !Equals [!Ref RetainData, "true"]
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-${Environment}-users"
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-app"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowInvoke
+            Effect: Allow
+            Principal: "*"
+            Action: execute-api:Invoke
+            Resource: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:*"
+          - Sid: DenyOutsideAllowlist
+            Effect: Deny
+            Principal: "*"
+            Action: execute-api:Invoke
+            Resource: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:*"
+            Condition:
+              NotIpAddress:
+                aws:SourceIp: !Ref AllowedSourceCidr
+
+  EventsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: events
+
+  UserResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref EventsResource
+      PathPart: user
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: harbor-users
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref Api
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+
+  RouterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-router-${Environment}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: router
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-router-${Environment}:*"
+              - Sid: SendToProjectQueues
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Sub "arn:${AWS::Partition}:sqs:*:${AWS::AccountId}:${ProjectName}-*"
+              - Sid: ReadFiles
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${Files.Arn}/*"
+              - Sid: ReadRoutingConfig
+                Effect: Allow
+                Action:
+                  - appconfig:StartConfigurationSession
+                  - appconfig:GetLatestConfiguration
+                Resource: !Sub "arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${RoutingApp}/*"
+
+  Router:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-router-${Environment}"
+      Runtime: python3.12
+      Handler: router.handler
+      Role: !GetAtt RouterRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ArtifactKey
+      Environment:
+        Variables:
+          APPCONFIG_APPLICATION: !Ref RoutingApp
+          APPCONFIG_ENVIRONMENT: !Ref RoutingEnv
+          APPCONFIG_PROFILE: !Ref RoutingProfile
+          BUCKET_NAME: !Ref Files
+
+  RouterPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Router
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"
+
+  EventsIamMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref EventsResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Router.Arn}/invocations"
+
+  EventsJwtMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref UserResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Router.Arn}/invocations"
+
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - EventsIamMethod
+      - EventsJwtMethod
+    Properties:
+      RestApiId: !Ref Api
+
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref Api
+      DeploymentId: !Ref Deployment
+      StageName: !Ref Environment
+
+  RoutingApp:
+    Type: AWS::AppConfig::Application
+    Properties:
+      Name: !Sub "${ProjectName}-routing"
+      Description: Tenant to queue map. Queue URLs are not hardcoded in the function.
+
+  RoutingEnv:
+    Type: AWS::AppConfig::Environment
+    Properties:
+      ApplicationId: !Ref RoutingApp
+      Name: !Ref Environment
+
+  RoutingProfile:
+    Type: AWS::AppConfig::ConfigurationProfile
+    Properties:
+      ApplicationId: !Ref RoutingApp
+      Name: routes
+      LocationUri: hosted
+      Type: AWS.Freeform
+
+  RoutingVersion:
+    Type: AWS::AppConfig::HostedConfigurationVersion
+    Properties:
+      ApplicationId: !Ref RoutingApp
+      ConfigurationProfileId: !Ref RoutingProfile
+      ContentType: application/json
+      Content: |
+        {
+          "acme": {
+            "region": "us-east-1",
+            "queue_url": "https://sqs.us-east-1.amazonaws.com/123456789012/harbor-acme-use1"
+          },
+          "globex": {
+            "region": "eu-west-1",
+            "queue_url": "https://sqs.eu-west-1.amazonaws.com/123456789012/harbor-globex-euw1"
+          }
+        }
+
+  RoutingDeployment:
+    Type: AWS::AppConfig::Deployment
+    Properties:
+      ApplicationId: !Ref RoutingApp
+      EnvironmentId: !Ref RoutingEnv
+      ConfigurationProfileId: !Ref RoutingProfile
+      ConfigurationVersion: !Ref RoutingVersion
+      DeploymentStrategyId: AppConfig.AllAtOnce
+
+  Files:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: !If [KeepBucket, Retain, Delete]
+    UpdateReplacePolicy: !If [KeepBucket, Retain, Delete]
+    Properties:
+      BucketName: !Sub "${ProjectName}-files-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FilesPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Files
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowGetFromAllowlistedIp
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt RouterRole.Arn
+            Action: s3:GetObject
+            Resource: !Sub "${Files.Arn}/*"
+            Condition:
+              IpAddress:
+                aws:SourceIp: !Ref AllowedSourceCidr
+          - Sid: AllowGetFromVpcEndpoint
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt RouterRole.Arn
+            Action: s3:GetObject
+            Resource: !Sub "${Files.Arn}/*"
+            Condition:
+              StringEquals:
+                aws:SourceVpce: !Ref VpcEndpointIdS3
+
+Outputs:
+  ApiEndpoint:
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+  RouterRoleArn:
+    Value: !GetAtt RouterRole.Arn
+  BucketArn:
+    Value: !GetAtt Files.Arn
+  BucketName:
+    Value: !Ref Files
